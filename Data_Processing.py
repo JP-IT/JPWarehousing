@@ -7,8 +7,17 @@ import threading
 import configparser
 import appdirs
 import ttkbootstrap as ttk
+import requests   # For fetching JSON and downloading new files
+import time       # For small waits in the self-updater logic
+import subprocess # For relaunching the app, if desired
 
-# Constants
+# =========================================
+# =            GLOBALS & CONFIG           =
+# =========================================
+
+# Bump your version string here whenever you release a new version
+APP_VERSION = "2.2.0"
+
 CONFIG_DIR = appdirs.user_data_dir("DataProcessingApp", "YourName")
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'app_config.ini')
 LOG_FILE = os.path.join(CONFIG_DIR, 'execution_log.txt')
@@ -16,6 +25,15 @@ os.makedirs(CONFIG_DIR, exist_ok=True)
 
 config = configparser.ConfigParser()
 
+# URL to your JSON metadata file:
+# For example, if you host it on GitHub, you might have:
+#   https://raw.githubusercontent.com/JP-IT/JPWarehousing/main/latest_release_info.json
+# or some other location. Adjust as needed.
+UPDATE_INFO_URL = "https://raw.githubusercontent.com/JP-IT/JPWarehousing/main/latest_release_info.json"
+
+# =========================================
+# =        CONFIG & LOGGING UTILS         =
+# =========================================
 
 def save_config(section, key, value):
     if not config.has_section(section):
@@ -24,32 +42,157 @@ def save_config(section, key, value):
     with open(CONFIG_FILE, 'w') as f:
         config.write(f)
 
-
 def load_config(section, key, default):
     config.read(CONFIG_FILE)
     return config.get(section, key, fallback=default)
-
 
 def log_message(message):
     with open(LOG_FILE, 'a') as log_file:
         log_file.write(message + '\n')
 
-
 def clear_log():
     with open(LOG_FILE, 'w') as log_file:
         log_file.write('')
 
+# =========================================
+# =           UPDATE-RELATED LOGIC        =
+# =========================================
+
+def check_for_updates():
+    """
+    Fetch version info from a remote JSON file and compare
+    with our current APP_VERSION. If a newer version is found,
+    prompt the user to download and update.
+    """
+    try:
+        response = requests.get(UPDATE_INFO_URL, timeout=10)  # 10s timeout
+        if response.status_code != 200:
+            messagebox.showerror("Update Check", f"Failed to fetch update info (status code {response.status_code}).")
+            return
+        data = response.json()
+        latest_version = data.get("version", "")
+        download_url = data.get("download_url", "")
+        notes = data.get("notes", "")  # optional field if you want to display release notes
+
+        if not latest_version or not download_url:
+            messagebox.showerror("Update Check", "Update info is incomplete. Please contact support.")
+            return
+
+        # Compare versions (simple string comparison can fail for e.g. 2.10 vs 2.2, so let's do a safe approach)
+        # Convert version strings into tuples of integers: "2.2.0" -> (2,2,0)
+        def version_tuple(v):
+            return tuple(map(int, (v.split("."))))
+
+        current_tuple = version_tuple(APP_VERSION)
+        remote_tuple = version_tuple(latest_version)
+
+        if remote_tuple > current_tuple:
+            # There's a newer version
+            msg = f"A newer version ({latest_version}) is available.\n\n"
+            if notes:
+                msg += f"Release notes:\n{notes}\n\n"
+            msg += "Would you like to download and install it now?"
+
+            if messagebox.askyesno("Update Available", msg):
+                # Start the update process
+                threading.Thread(target=download_and_replace, args=(download_url, latest_version), daemon=True).start()
+        else:
+            messagebox.showinfo("Update Check", f"You are running the latest version ({APP_VERSION}).")
+    except Exception as e:
+        messagebox.showerror("Update Check", f"Error checking for updates: {e}")
+
+def download_and_replace(download_url, new_version):
+    """
+    Download the new EXE to a temporary file, then do a self-update.
+    This approach closes the current app, overwrites the old EXE,
+    and re-launches the new version if desired.
+    """
+    # Indicate in the UI that we're downloading
+    status_label.config(text="Downloading new version...")
+    try:
+        # 1) Download the new EXE file to a temporary location
+        temp_exe_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data_Processing_new.exe")
+
+        r = requests.get(download_url, stream=True, timeout=30)
+        total_size = int(r.headers.get('content-length', 0))
+        chunk_size = 1024 * 64
+        downloaded_size = 0
+
+        with open(temp_exe_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    downloaded_size += len(chunk)
+                    percent = (downloaded_size / total_size) * 100 if total_size else 0
+                    status_label.config(text=f"Downloading new version... {percent:.1f}%")
+                    root.update_idletasks()
+
+        r.close()
+
+        # 2) Inform the user that the app will close for the update
+        messagebox.showinfo("Update", "Download complete! The application will now close to apply the update.")
+
+        # 3) Launch a small update procedure in a separate thread (or script).
+        #    We'll do it in a thread for simplicity here:
+        threading.Thread(target=apply_update_and_restart, args=(temp_exe_path,), daemon=True).start()
+
+        # 4) Close the current app so files aren't locked
+        #    (In a real self-updater, we might let the update thread handle everything
+        #     and not close the main thread until it’s done. But this is simpler.)
+        root.quit()
+
+    except Exception as e:
+        messagebox.showerror("Update Error", f"Failed to download or replace the new version. Error: {e}")
+        status_label.config(text="Update failed.")
+
+def apply_update_and_restart(temp_exe_path):
+    """
+    Wait for the main app to exit, overwrite the old EXE, then
+    re-launch the new version. On Windows, a short delay is typically
+    needed to ensure the main .exe is fully released.
+    """
+    time.sleep(3)  # Wait a bit for the main program to exit fully
+
+    # The running script path (old EXE if we are frozen) or .py file location
+    current_exe_path = os.path.abspath(__file__)
+
+    # If we are PyInstaller-frozen, __file__ might be something like:
+    #   C:\Path\To\dist\Data_Processing.exe\Data_Processing.py
+    # That means we need to figure out the real EXE path. Typically:
+    #   sys.executable
+    import sys
+    if getattr(sys, 'frozen', False):
+        current_exe_path = sys.executable  # the full path to the .exe
+
+    # Overwrite: rename old file to something else or delete it, then rename new one to old name
+    try:
+        # Possibly remove the old file first
+        os.remove(current_exe_path)
+
+        # Move the new file in place
+        os.rename(temp_exe_path, current_exe_path)
+
+        # Re-launch the new version
+        subprocess.Popen([current_exe_path], shell=False)
+
+    except Exception as e:
+        # If this fails, user may have to manually rename or do something else
+        # In a real scenario, you might keep a second "backup" approach
+        pass
+
+
+# =========================================
+# =          EXISTING APP LOGIC           =
+# =========================================
 
 def on_close():
     save_config('PATHS', 'output_path', output_path.get())
     save_config('PATHS', 'processed_path', processed_path.get())
     root.destroy()
 
-
 def get_client_name_from_filename(filename):
     base_name = os.path.basename(filename).upper()
     return 'VANDERBILT' if base_name.startswith('VAN') else 'SILVER POINT' if base_name.startswith('SPT') else 'UNKNOWN'
-
 
 def get_store_name(item_number, filename):
     if 'VAN' in filename or 'SPT' in filename:
@@ -57,10 +200,8 @@ def get_store_name(item_number, filename):
     store_initials = item_number[:2].upper() if item_number else ''
     return {'LP': 'LIFEPRO', 'PC': 'PETCOVE', 'JB': 'JOYBERRI'}.get(store_initials, 'UNKNOWN')
 
-
 def normalize_header(header):
     return header.upper()
-
 
 def map_columns(df, filename):
     header_mappings = {
@@ -85,7 +226,6 @@ def map_columns(df, filename):
             df_renamed[col] = df_renamed[col].astype(str)
 
     return df_renamed, store_name
-
 
 def process_file_to_csv(input_file_path, output_file_folder, processed_folder):
     log_message(f"Processing file: {input_file_path}")
@@ -166,11 +306,9 @@ def process_file_to_csv(input_file_path, output_file_folder, processed_folder):
     except Exception as e:
         log_message(f"Error processing file {input_file_path}: {e}")
 
-
 def start_processing():
     clear_log()
     threading.Thread(target=process_files, daemon=True).start()
-
 
 def process_files():
     output_folder = output_path.get()
@@ -189,7 +327,6 @@ def process_files():
     progress_bar['value'] = 100
     status_label.config(text="Processing complete.")
 
-
 def show_help():
     help_text = """
     How to Use the App:
@@ -203,7 +340,6 @@ def show_help():
     """
     messagebox.showinfo("Help - How to Use", help_text)
 
-
 def show_logs():
     with open(LOG_FILE, 'r') as log_file:
         logs = log_file.read()
@@ -214,7 +350,6 @@ def show_logs():
     log_text.config(state=tk.DISABLED)
     log_text.pack(expand=True, fill=tk.BOTH)
 
-
 def browse_folder(entry_field):
     directory = filedialog.askdirectory()
     if directory:
@@ -222,22 +357,17 @@ def browse_folder(entry_field):
         entry_field.insert(0, directory)
         save_config('PATHS', entry_field.winfo_name(), directory)
 
-
 def parse_color_profile(profile_str):
     return dict(item.split(':') for item in profile_str.split(';'))
-
 
 def load_color_profiles():
     return {key: parse_color_profile(config.get('COLOR_PROFILES', key)) for key in config.options('COLOR_PROFILES')}
 
-
 def save_color_profile(profile_name):
     save_config('SETTINGS', 'color_profile', profile_name)
 
-
 def load_saved_color_profile():
     return load_config('SETTINGS', 'color_profile', 'Default')
-
 
 def apply_color_profile(profile):
     style = ttk.Style()
@@ -260,19 +390,17 @@ def apply_color_profile(profile):
         elif widget_class == 'Frame':  # For non-ttk Frame widgets
             widget.config(bg=profile.get('bg_color', '#F0F0F0'))
 
-
 def set_color_profile(profile_name):
     profiles = load_color_profiles()
     if profile_name in profiles:
         apply_color_profile(profiles[profile_name])
         save_color_profile(profile_name)
 
-
 def create_ui():
     global root, output_path, processed_path, progress_bar, status_label
 
     root = ttk.Window(themename="litera")
-    root.title("File Processor")
+    root.title(f"File Processor (v{APP_VERSION})")  # Show version in title
 
     style = ttk.Style()
     theme = 'litera'
@@ -287,16 +415,23 @@ def create_ui():
     menu_bar = Menu(root)
     root.config(menu=menu_bar)
 
+    # ======== File Menu ========
     file_menu = Menu(menu_bar, tearoff=0)
     menu_bar.add_cascade(label="File", menu=file_menu)
     file_menu.add_command(label="Execution Logs", command=show_logs)
     file_menu.add_separator()
     file_menu.add_command(label="Exit", command=root.quit)
 
+    # ======== Color Profile ========
     color_menu = Menu(file_menu, tearoff=0)
     for profile_name in load_color_profiles().keys():
         color_menu.add_command(label=profile_name, command=lambda name=profile_name: set_color_profile(name))
     file_menu.add_cascade(label="Color Profile", menu=color_menu)
+
+    # ======== Update Menu ========
+    update_menu = Menu(menu_bar, tearoff=0)
+    menu_bar.add_cascade(label="Update", menu=update_menu)
+    update_menu.add_command(label="Check for Updates", command=check_for_updates)
 
     ttk.Button(root, text='Process Files', command=start_processing, bootstyle="secondary-outline").grid(row=0,
                                                                                                          column=0,
@@ -323,7 +458,6 @@ def create_ui():
     status_label = ttk.Label(root, text="Select files and start processing", bootstyle="secondary")
     status_label.grid(row=5, column=0, columnspan=3, padx=10, pady=10, sticky=(tk.W + tk.E))
 
-
 def main():
     config.read(CONFIG_FILE)
     if not config.has_section('COLOR_PROFILES'):
@@ -342,7 +476,6 @@ def main():
     set_color_profile(saved_profile_name)
 
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
